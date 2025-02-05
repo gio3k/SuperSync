@@ -1,0 +1,6 @@
+{
+  "name": "SuperSync.Runtime",
+  "references": [
+    "Unity.Netcode.Runtime"
+  ]
+}

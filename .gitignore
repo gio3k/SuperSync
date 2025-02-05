@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# Debugging information
+*.pdb
+*.pdb.meta
