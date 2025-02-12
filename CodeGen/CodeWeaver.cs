@@ -19,22 +19,23 @@ namespace SuperSync.CodeGen
 
             // Figure out what we want the T1 in NetworkVariable<T1> to be
             // If we're handling a NetworkObject or NetworkBehaviour, we want to use their wrappers
-            TypeReference networkVariableT1;
+            TypeReference t1;
             if (propertyWithSyncAttribute.IsDerivedFromNetworkBehaviour)
-                networkVariableT1 = moduleReferences.NetworkBehaviourReference;
+                t1 = moduleReferences.NetworkBehaviourReference;
             else if (propertyWithSyncAttribute.IsDerivedFromNetworkObject)
-                networkVariableT1 = moduleReferences.NetworkObjectReference;
+                t1 = moduleReferences.NetworkObjectReference;
             else
-                networkVariableT1 = module.ImportReference(propertyWithSyncAttribute.Property.PropertyType);
+                t1 = module.ImportReference(propertyWithSyncAttribute.Property.PropertyType);
 
-            // Get references to NetworkVariable<T1> methods
+            // Get references to (Anticipated)NetworkVariable<T1> methods
             result.NetworkVariableReferences =
-                new NetworkVariableReferences(module, moduleReferences, networkVariableT1);
+                new NetworkVariableReferences(module, moduleReferences, t1,
+                    propertyWithSyncAttribute.ShouldCreateAnticipatedVariable);
 
             // Create the "backing field" of type NetworkVariable we're going to use
             result.WeavedBackingField = new FieldDefinition($"__Netvar_{propertyWithSyncAttribute.Property.Name}",
                 FieldAttributes.Private,
-                result.NetworkVariableReferences.NetworkVariableWithT1Reference);
+                result.NetworkVariableReferences.NetworkVariableT1);
             type.Fields.Add(result.WeavedBackingField);
 
             // Edit the setter body
@@ -60,8 +61,17 @@ namespace SuperSync.CodeGen
                             .GetWrapperConversionFunctionReturningWrapperType(moduleReferences));
                 }
 
-                // ... '= value'
-                processor.Emit(OpCodes.Callvirt, result.NetworkVariableReferences.Setter);
+                if (propertyWithSyncAttribute.ShouldCreateAnticipatedVariable)
+                {
+                    // ... '.Anticipate(value)'
+                    processor.Emit(OpCodes.Callvirt,
+                        result.NetworkVariableReferences.AnticipatedNetworkVariableT1_Anticipate);
+                }
+                else
+                {
+                    // ... '= value'
+                    processor.Emit(OpCodes.Callvirt, result.NetworkVariableReferences.NetworkVariableT1_Setter);
+                }
 
                 // 'return'
                 processor.Emit(OpCodes.Ret);
@@ -81,7 +91,7 @@ namespace SuperSync.CodeGen
                 processor.Emit(OpCodes.Ldarg_0); // Load instance 'this'
                 processor.Emit(OpCodes.Ldfld, result.WeavedBackingField); // Load field '__Netvar_<property>'
                 processor.Emit(OpCodes.Callvirt,
-                    result.NetworkVariableReferences.Getter); // Call NetworkVariable<T1>.Value
+                    result.NetworkVariableReferences.NetworkVariableT1_Getter); // Call NetworkVariable<T1>.Value
 
                 // Emit wrapper for the value if required
                 if (propertyWithSyncAttribute.RequiresWrapper)
@@ -241,26 +251,50 @@ namespace SuperSync.CodeGen
                 }
                 else
                 {
-                    // Pass the default value variable to argument 1 of the NetworkVariable constructor
-                    newInstructions.Add(localVariableForDefaultValue != null
-                        ? processor.Create(OpCodes.Ldloc_S, localVariableForDefaultValue)
-                        // Pass 0 to argument 1 of the NetworkVariable constructor
-                        : processor.Create(OpCodes.Ldc_I4_0));
+                    // If we have a default value,
+                    // pass the default value variable to argument 1 of the NetworkVariable constructor
+                    if (localVariableForDefaultValue != null)
+                    {
+                        newInstructions.Add(processor.Create(OpCodes.Ldloc_S, localVariableForDefaultValue));
+                    }
+                    else
+                    {
+                        // We don't have a default value
+                        // Push a valid default value for this type onto the stack
+                        foreach (var instruction in weavedProperty
+                                     .PropertyWithSyncAttribute
+                                     .Property
+                                     .PropertyType
+                                     .GetLoadDefaultInstructions(module))
+                        {
+                            newInstructions.Add(instruction);
+                        }
+                    }
                 }
 
-                // See what NetworkVariable constructor argument 2 (read permissions) should be
-                newInstructions.Add(processor.Create(OpCodes.Ldc_I4,
-                    (int)weavedProperty.PropertyWithSyncAttribute.SyncFlags
-                        .ToReadPermission()));
+                if (weavedProperty.PropertyWithSyncAttribute.ShouldCreateAnticipatedVariable)
+                {
+                    // Emit secondary arguments for AnticipatedNetworkVariable<T1>
+                    // See what AnticipatedNetworkVariable constructor argument 2 (StaleDataHandling) should be
+                    newInstructions.Add(processor.Create(OpCodes.Ldc_I4, 0));
+                }
+                else
+                {
+                    // Emit secondary arguments for NetworkVariable<T1>
+                    // See what NetworkVariable constructor argument 2 (read permissions) should be
+                    newInstructions.Add(processor.Create(OpCodes.Ldc_I4,
+                        (int)weavedProperty.PropertyWithSyncAttribute.SyncFlags
+                            .ToReadPermission()));
 
-                // See what NetworkVariable constructor argument 3 (write permissions) should be
-                newInstructions.Add(processor.Create(OpCodes.Ldc_I4,
-                    (int)weavedProperty.PropertyWithSyncAttribute.SyncFlags
-                        .ToWritePermission()));
+                    // See what NetworkVariable constructor argument 3 (write permissions) should be
+                    newInstructions.Add(processor.Create(OpCodes.Ldc_I4,
+                        (int)weavedProperty.PropertyWithSyncAttribute.SyncFlags
+                            .ToWritePermission()));
+                }
 
                 // Create the NetworkVariable
                 newInstructions.Add(processor.Create(OpCodes.Newobj,
-                    weavedProperty.NetworkVariableReferences.Constructor));
+                    weavedProperty.NetworkVariableReferences.NetworkVariableT1_Constructor));
 
                 // Set the weaved backing field
                 newInstructions.Add(processor.Create(OpCodes.Stfld, weavedProperty.WeavedBackingField));
@@ -269,6 +303,84 @@ namespace SuperSync.CodeGen
             // Add the new instructions
             // We need to add them before the base ctor call
             processor.CopyBefore(callBaseCtorInstruction, newInstructions);
+        }
+
+        public static void WeaveAllReplaceableCalls(TypeDefinition type,
+            List<WeavedProperty> weavedProperties,
+            ModuleDefinition module,
+            ModuleReferences moduleReferences)
+        {
+            foreach (var methodDefinition in type.Methods)
+            {
+                var processor = methodDefinition
+                    .Body
+                    .GetILProcessor();
+
+                for (var index = processor.Body.Instructions.Count - 1; index >= 0; index--)
+                {
+                    var callGetVariableInstruction = processor.Body.Instructions[index];
+                    if (callGetVariableInstruction.OpCode != OpCodes.Call)
+                        continue;
+
+                    if (callGetVariableInstruction.Operand is not MethodReference methodReference)
+                        continue;
+
+                    // If we compare these with any more specificity we'll not find it
+                    if (methodReference.DeclaringType.Name != moduleReferences.SyncUtils.Name ||
+                        (methodReference.Name != moduleReferences.SyncUtils_GetVariableT1_retNetworkVariableT1.Name &&
+                         methodReference.Name != moduleReferences
+                             .SyncUtils_GetAnticipatedVariableT1_retAnticipatedNetworkVariableT1.Name))
+                        continue;
+
+                    // We found the call!
+                    // Here's a little explanation for what we're doing here
+                    // If we have a sync var defined as "[Sync] public int MySyncVar {get; set;}",
+                    // in a non-static type called "TypeExample",
+                    // and we write this statement: "var a = SyncUtils.GetVariable(MySyncVar)"
+                    // We get this IL:
+                    // "ldarg.0" - load 'this' on to the stack
+                    // "call" "TypeExample::get_MySyncVar" - get the value in MySyncVar by running its getter,
+                    //      put it on the stack
+                    // "call" "SuperSync::GetVariable<NetworkVariable<int>>" - get the value returned by GetVariable,
+                    //      put on the stack
+                    // "stloc.0" - set our local variable (which is 'a') to be the value returned by GetVariable
+
+                    // We don't really want that to happen though, and we want GetVariable to return the NetworkVariable
+                    // that's behind the sync variable 'MySyncVar'
+
+                    if (callGetVariableInstruction.Previous is not { } callPropertyGetterInstruction ||
+                        callPropertyGetterInstruction.OpCode != OpCodes.Call ||
+                        callPropertyGetterInstruction.Operand is not MethodReference propertyGetterReference)
+                    {
+                        // Unexpected instruction prior to the call
+                        continue;
+                    }
+
+                    // Let's find the property used in argument 1 of GetVariable()
+                    var weavedProperty = weavedProperties.FirstOrDefault(v =>
+                        v.PropertyWithSyncAttribute.Property.GetMethod.Name == propertyGetterReference.Name);
+
+                    if (weavedProperty.PropertyWithSyncAttribute == null)
+                        continue;
+
+                    // Make sure the user is using the right GetVariable function
+                    if (weavedProperty.PropertyWithSyncAttribute.ShouldCreateAnticipatedVariable &&
+                        methodReference.Name != moduleReferences
+                            .SyncUtils_GetAnticipatedVariableT1_retAnticipatedNetworkVariableT1.Name)
+                    {
+                        continue; // They should be using GetAnticipatedVariable
+                    }
+
+                    // Save the instructions directly after the calls, then remove the calls
+                    var instructionAfterCalls = callGetVariableInstruction.Next;
+                    processor.Remove(callGetVariableInstruction);
+                    processor.Remove(callPropertyGetterInstruction);
+
+                    // Add an instruction that pushes the backing field to the stack before the instruction we saved
+                    processor.InsertBefore(instructionAfterCalls,
+                        processor.Create(OpCodes.Ldfld, weavedProperty.WeavedBackingField));
+                }
+            }
         }
     }
 }

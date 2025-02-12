@@ -62,6 +62,9 @@ namespace SuperSync.CodeGen
                     // Weave constructor now that we have all the properties weaved
                     if (weavedProperties.Any())
                         CodeWeaver.WeaveConstructor(type, weavedProperties, module, moduleReferences);
+
+                    // Weave replaceable types (like SyncUtils.GetVariable)
+                    CodeWeaver.WeaveAllReplaceableCalls(type, weavedProperties, module, moduleReferences);
                 }
             }
 

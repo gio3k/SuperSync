@@ -7,8 +7,8 @@ namespace SuperSync.CodeGen
 		public static void Log( string message )
 		{
 			// note: can't really log to a console in unity ILPP codegen, so I just log to a file
-			// const string p = "/Users/gio/dev/team-projects/smallfish/SaunaUnity/test.txt";
-			// File.AppendAllText( p, $"{message}\n" );
+			const string p = "/Users/gio/dev/projects/gamedev/unity-projects/NetcodeTesting/log.txt";
+			File.AppendAllText( p, $"{message}\n" );
 		}
 	}
 }
